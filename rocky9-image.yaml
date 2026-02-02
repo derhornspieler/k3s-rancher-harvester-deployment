@@ -1,0 +1,14 @@
+---
+# Rocky 9 GenericCloud Image - Harvester Public Namespace
+apiVersion: harvesterhci.io/v1beta1
+kind: VirtualMachineImage
+metadata:
+  name: rocky9-genericcloud
+  namespace: harvester-public
+  labels:
+    harvesterhci.io/os: rocky
+spec:
+  displayName: "Rocky Linux 9 - GenericCloud (Latest)"
+  description: "Rocky Linux 9 GenericCloud image for virtual machines"
+  sourceType: download
+  url: "https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"

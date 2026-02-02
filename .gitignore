@@ -1,0 +1,33 @@
+# Temporary files
+*.tmp
+*.log
+*.swp
+*~
+
+# Secrets and sensitive data
+*-secret.yaml
+*password*
+*.key
+*.pem
+
+# Actual deployment files with real credentials
+rancher-single-node.yaml
+vm-network-custom.yaml
+*-prod.yaml
+*-production.yaml
+
+# Editor files
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*-old.yaml
+*-revised.yaml
+*-corrected.yaml

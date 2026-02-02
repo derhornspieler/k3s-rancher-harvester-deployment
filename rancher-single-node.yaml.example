@@ -1,0 +1,230 @@
+---
+# Cloud-init for Single-Node Rancher with K3s + MetalLB
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rancher-cloudinit
+  namespace: rancher-mgmt
+type: Opaque
+stringData:
+  userData: |
+    #cloud-config
+    hostname: rancher-mgmt
+    users:
+      - name: rocky
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        groups: wheel
+        shell: /bin/bash
+        ssh_authorized_keys:
+          - YOUR_SSH_PUBLIC_KEY_HERE  # Replace with your SSH public key from ~/.ssh/id_*.pub
+
+    package_update: true
+    package_upgrade: false
+    packages:
+      - curl
+      - wget
+      - qemu-guest-agent
+      - firewalld
+
+    write_files:
+      - path: /etc/rancher/k3s/config.yaml
+        owner: root:root
+        permissions: '0644'
+        content: |
+          write-kubeconfig-mode: "0644"
+          tls-san:
+            - "YOUR_RANCHER_HOSTNAME_HERE"  # e.g., rancher.example.com
+            - "YOUR_METALLB_VIP_HERE"  # e.g., 192.168.1.100
+
+      - path: /tmp/metallb-namespace.yaml
+        content: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: metallb-system
+            labels:
+              pod-security.kubernetes.io/enforce: privileged
+              pod-security.kubernetes.io/audit: privileged
+              pod-security.kubernetes.io/warn: privileged
+
+      - path: /tmp/metallb-ippool.yaml
+        content: |
+          ---
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: rancher-pool
+            namespace: metallb-system
+          spec:
+            addresses:
+            - YOUR_METALLB_VIP_HERE-YOUR_METALLB_VIP_HERE  # e.g., 192.168.1.100-192.168.1.100
+          ---
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: l2-advert
+            namespace: metallb-system
+          spec:
+            ipAddressPools:
+            - rancher-pool
+
+    runcmd:
+      # Configure firewall
+      - systemctl enable --now firewalld
+      - firewall-cmd --permanent --add-port=80/tcp
+      - firewall-cmd --permanent --add-port=443/tcp
+      - firewall-cmd --permanent --add-port=6443/tcp
+      - firewall-cmd --permanent --add-masquerade
+      - firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16
+      - firewall-cmd --reload
+
+      # Install K3s with servicelb disabled (MetalLB will handle LoadBalancer services)
+      - curl -sfL https://get.k3s.io | sh -s - server --disable servicelb
+
+      # Wait for K3s
+      - sleep 30
+      - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      - until kubectl get nodes 2>/dev/null; do sleep 5; done
+
+      # Install Helm
+      - curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      # Install MetalLB
+      - kubectl apply -f /tmp/metallb-namespace.yaml
+      - kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.3/config/manifests/metallb-native.yaml
+      - sleep 45
+      - kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=300s
+      - kubectl apply -f /tmp/metallb-ippool.yaml
+
+      # Install cert-manager
+      - helm repo add jetstack https://charts.jetstack.io
+      - helm repo update
+      - |
+        helm install cert-manager jetstack/cert-manager \
+          --namespace cert-manager \
+          --create-namespace \
+          --set crds.enabled=true \
+          --wait --timeout=10m
+
+      # Wait for cert-manager
+      - kubectl wait --namespace cert-manager --for=condition=Available deployment --all --timeout=600s
+
+      # Install Rancher
+      - helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+      - helm repo update
+      - |
+        helm install rancher rancher-stable/rancher \
+          --namespace cattle-system \
+          --create-namespace \
+          --set hostname=YOUR_RANCHER_HOSTNAME_HERE \
+          --set replicas=1 \
+          --set bootstrapPassword='YOUR_SECURE_PASSWORD_HERE' \
+          --set global.cattle.psp.enabled=false \
+          --set ingress.ingressClassName=traefik \
+          --wait \
+          --timeout=20m
+
+      # Annotate Traefik service to use MetalLB VIP
+      - kubectl annotate svc traefik -n kube-system "metallb.universe.tf/address-pool=rancher-pool" --overwrite
+
+      # Enable qemu-guest-agent
+      - systemctl enable --now qemu-guest-agent.service
+      - touch /var/lib/cloud/instance/rancher-ready
+
+    final_message: "Rancher single-node deployment complete!"
+
+  networkData: |
+    version: 2
+    ethernets:
+      eth0:
+        dhcp4: true
+
+---
+# VirtualMachine: Single-Node Rancher
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: rancher-mgmt
+  namespace: rancher-mgmt
+  labels:
+    harvesterhci.io/os: rocky
+  annotations:
+    harvesterhci.io/vmRunStrategy: RerunOnFailure
+    harvesterhci.io/imageId: "harvester-public/rocky9-genericcloud"
+    harvesterhci.io/volumeClaimTemplates: >-
+      [{
+        "metadata": {
+          "name": "rancher-mgmt-disk-0",
+          "annotations": {
+            "harvesterhci.io/imageId": "harvester-public/rocky9-genericcloud"
+          }
+        },
+        "spec": {
+          "accessModes": ["ReadWriteMany"],
+          "resources": {"requests": {"storage": "80Gi"}},
+          "volumeMode": "Block",
+          "storageClassName": "longhorn-rocky9-genericcloud"
+        }
+      }]
+spec:
+  runStrategy: RerunOnFailure
+  template:
+    metadata:
+      labels:
+        harvesterhci.io/vmName: rancher-mgmt
+    spec:
+      architecture: amd64
+      domain:
+        cpu:
+          cores: 4
+          sockets: 1
+          threads: 1
+        memory:
+          guest: 16Gi
+        resources:
+          requests:
+            cpu: 2
+            memory: 8Gi
+          limits:
+            cpu: 4
+            memory: 16Gi
+        devices:
+          disks:
+            - name: disk-0
+              bootOrder: 1
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              bridge: {}
+              model: virtio
+        features:
+          acpi:
+            enabled: true
+        firmware:
+          bootloader:
+            efi:
+              persistent: true
+              secureBoot: false
+        machine:
+          type: q35
+      evictionStrategy: LiveMigrateIfPossible
+      hostname: rancher-mgmt
+      networks:
+        - name: default
+          multus:
+            networkName: default/vm-network
+      terminationGracePeriodSeconds: 120
+      volumes:
+        - name: disk-0
+          persistentVolumeClaim:
+            claimName: rancher-mgmt-disk-0
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            secretRef:
+              name: rancher-cloudinit
+            networkDataSecretRef:
+              name: rancher-cloudinit
